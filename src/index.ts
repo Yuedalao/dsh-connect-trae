@@ -49,6 +49,7 @@ import type { TraePoolCredits, TraePoolMember, TraePoolOutcome, TraePoolProbe } 
 import { checkinAllAccounts, probeUpdatesOf, testAllAccounts, type TraePoolRunnerDeps } from './account-pool-run.ts'
 import type { TraePoolCheckinRow, TraePoolTestRow } from './account-pool-run.ts'
 import { dropTraePoolProbe, readTraePoolProbes, writeTraePoolProbes } from './account-pool-store.ts'
+import { providerDisplayNameWithCredit } from './provider-credit.ts'
 
 export {
   adaptLegacyPiAiContext,
@@ -515,6 +516,7 @@ const REGION_KEYS: readonly TraeRegion[] = ['cn', 'ai']
  * a day, so a genuine second check-in still shows up on the next poll after it.
  */
 const CHECKIN_CACHE_MS = 10 * 60_000
+const PROVIDER_CREDIT_REFRESH_MS = 5 * 60_000
 
 /**
  * What ONE failed real request means for the account that served it (issue #44).
@@ -1742,11 +1744,16 @@ export function apply(ctx: Context, config: Config): void {
    * actually removes the region's models from DSH's model picker — hiding the
    * card tab alone would leave every model selectable.
    */
+  let stopped = false
+  let creditTimer: ReturnType<typeof setInterval> | undefined
   const registration: Record<TraePanel, {
     /** The handle publishing this panel's provider id. */
-    adapters: { provider: string; handle: AdapterRegistrationHandle }[]
+    adapters: { provider: string; handle: AdapterRegistrationHandle; adapter: TraeAdapter }[]
     directory?: DirectoryRegistrationHandle
   }> = { cn: { adapters: [] }, enterprise: { adapters: [] }, ai: { adapters: [] } }
+  const providerCredits = new Map<TraePanel, number | undefined>()
+  const providerCreditRefreshes: Partial<Record<TraePanel, Promise<void>>> = {}
+  const lastProviderCreditRefreshAt: Partial<Record<TraePanel, number>> = {}
 
   /** Release every live registration this apply() created. */
   const disposeRegistration = (): void => {
@@ -1756,6 +1763,58 @@ export function apply(ctx: Context, config: Config): void {
     }
     registration.cn.directory?.()
     delete registration.cn.directory
+  }
+
+  /** Apply one known balance to the panel's provider heading. */
+  const setProviderCredit = (panel: TraePanel, remaining: number | undefined): void => {
+    if (providerCredits.get(panel) === remaining) return
+    providerCredits.set(panel, remaining)
+    const entry = registration[panel].adapters[0]
+    if (entry === undefined) return
+    const heading = providerDisplayNameWithCredit(
+      displayNameOfTraeProvider(entry.provider),
+      remaining,
+    )
+    if (!entry.adapter.setDisplayName(heading)) return
+    entry.handle.replace(regionEnabled(current(), panel) ? [entry.provider] : [])
+  }
+
+  /**
+   * Refresh the CN consumer provider's heading.
+   *
+   * Trae enterprise is a separate tenant quota and the international provider
+   * is subscription-based, so neither is presented as a personal credit count.
+   */
+  const refreshProviderCredit = async (panel: TraePanel, force = false): Promise<void> => {
+    if (stopped || panel !== 'cn' || !regionEnabled(current(), panel)) return
+    if (!force
+      && Date.now() - (lastProviderCreditRefreshAt[panel] ?? 0) < PROVIDER_CREDIT_REFRESH_MS) {
+      return
+    }
+    const inflight = providerCreditRefreshes[panel]
+    if (inflight !== undefined) return inflight
+    lastProviderCreditRefreshAt[panel] = Date.now()
+    let run: Promise<void>
+    run = (async () => {
+      try {
+        const before = await stacks[panel].store.current()
+        const beforeId = before === undefined ? undefined : traeAccountId(before)
+        const snapshot = await stacks[panel].usageClient.snapshot()
+        const after = await stacks[panel].store.current()
+        const afterId = after === undefined ? undefined : traeAccountId(after)
+        if (beforeId !== afterId) return
+        const credits = toCredits(snapshot)
+        if (stopped) return
+        setProviderCredit(panel, credits.generalAvailable)
+      } catch (error: unknown) {
+        if (stopped) return
+        ctx.logger.warn('dsh-connect-trae: provider balance unavailable', error)
+      }
+    })().finally(() => {
+      if (providerCreditRefreshes[panel] === run) delete providerCreditRefreshes[panel]
+    })
+    providerCreditRefreshes[panel] = run
+    return run
   }
 
   /**
@@ -1893,11 +1952,13 @@ export function apply(ctx: Context, config: Config): void {
   ;(ctx as unknown as { on(name: string, listener: () => void): unknown })
     .on('loader/volatile-update', () => {
       applySelection(current())
+      void refreshProviderCredit('cn', true)
     })
 
-  let stopped = false
   ctx.effect(() => () => {
     stopped = true
+    if (creditTimer !== undefined) clearInterval(creditTimer)
+    creditTimer = undefined
     for (const panel of TRAE_PANELS) void stacks[panel].shim.close()
   })
 
@@ -1932,7 +1993,11 @@ export function apply(ctx: Context, config: Config): void {
         // explicitly legal. `syncRegionRegistration` below then withdraws the
         // route for a panel the user has switched off, in the same synchronous
         // section, so nothing observes the transient route.
-        registration[panel].adapters.push({ provider, handle: ctx.llm.registerAdapter([provider], trae.adapter) })
+        registration[panel].adapters.push({
+          provider,
+          handle: ctx.llm.registerAdapter([provider], trae.adapter),
+          adapter: trae,
+        })
       }
       ctx.llm.registerModelDiscovery(settingsNs, async (request, signal) => {
         const panel = panelOfProvider(request.provider ?? '')
@@ -1976,6 +2041,11 @@ export function apply(ctx: Context, config: Config): void {
       // Converge both regions on the saved state: a region switched off while
       // the harness was down is withdrawn here, before the startup seed below.
       syncRegionRegistration(current())
+      void refreshProviderCredit('cn', true)
+      creditTimer = setInterval(() => {
+        void refreshProviderCredit('cn')
+      }, PROVIDER_CREDIT_REFRESH_MS)
+      creditTimer.unref?.()
     } finally {
       if (
         registration.cn.adapters.length === 0

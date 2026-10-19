@@ -425,11 +425,13 @@ export interface TraeAdapterOptions {
 export interface TraeAdapter {
   adapter: PiAiAdapter
   invalidate(): void
+  /** Change the provider heading without changing its stable route id. */
+  setDisplayName(displayName: string): boolean
 }
 
 export function createTraeAdapter(options: TraeAdapterOptions): TraeAdapter {
   const providerId = options.provider ?? TRAE_PROVIDER
-  const providerName = options.displayName ?? 'Trae'
+  let providerName = options.displayName ?? 'Trae'
   // The generation gate: what THIS plugin resolves, not what the host runs.
   // Getting it from the host would be wrong in exactly the case that produced
   // issue #27 — a nested older copy shadows the host's newer one.
@@ -459,7 +461,7 @@ export function createTraeAdapter(options: TraeAdapterOptions): TraeAdapter {
     models: buildModels(),
     api: withContextAdaptation(openAICompletionsApi(), generation),
   })
-  const provider: Provider = { ...base, getModels: () => buildModels() }
+  let provider: Provider = { ...base, getModels: () => buildModels() }
   const profile: ResolvedPiAiProviderProfile = {
     provider: providerId,
     displayName: providerName,
@@ -500,6 +502,16 @@ export function createTraeAdapter(options: TraeAdapterOptions): TraeAdapter {
     adapter,
     invalidate() {
       profiles = new Map([[providerId, profile]])
+    },
+    setDisplayName(next) {
+      const normalized = next.trim()
+      if (normalized === '' || normalized === providerName) return false
+      providerName = normalized
+      profile.displayName = normalized
+      provider = { ...provider, name: normalized }
+      profile.piProvider = provider
+      profiles = new Map([[providerId, profile]])
+      return true
     },
   }
 }
